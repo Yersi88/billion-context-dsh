@@ -60,15 +60,27 @@ export function findOpenTurn(events: readonly SessionEvent[]): number | null {
   return open
 }
 
-/** Reject a second concurrent compaction for the same session. */
+/**
+ * Reject a second concurrent compaction for the same session.
+ *
+ * A dangling compaction/start in the append-only log is always stale for this
+ * caller: runCompactionTransaction runs synchronously, so while it is genuinely
+ * in flight no other compress call can execute this guard — if the guard is
+ * executing, the writer is gone (crash, SIGKILL, or a throw inside the
+ * transaction before the end append). The previous permanent throw poisoned
+ * every later compress call for the session, surviving restarts, with no reset
+ * path (live session hit via 'surface replace: start seq N not found in
+ * surface'). Warn and proceed: the new transaction's own compaction/end
+ * re-pairs the log.
+ */
 export function assertNoActiveCompaction(events: readonly SessionEvent[]): void {
-  let active = false
-  for (const event of events) {
-    if (event.type === 'compaction/start') active = true
-    else if (event.type === 'compaction/end') active = false
+  let activeAt: number | null = null
+  for (const [i, event] of events.entries()) {
+    if (event.type === 'compaction/start') activeAt = i
+    else if (event.type === 'compaction/end') activeAt = null
   }
-  if (active) {
-    throw new Error('billion-context-dsh: another compaction is already active for this session')
+  if (activeAt !== null) {
+    console.warn(`billion-context-dsh: clearing stale compaction flag (compaction/start at event ${activeAt} has no matching end)`)
   }
 }
 
@@ -370,6 +382,11 @@ export function runCompactionTransaction(
   const seqs: number[] = []
 
   seqs.push(session.append('compaction/start', { compactionId, turn }).seq)
+  // Everything between the start and end appends is wrapped so a throw
+  // (stale-seq surface replace, serialization error, crash) appends a
+  // compensating compaction/end before rethrowing — new dangling starts
+  // cannot be created by a failed transaction.
+  try {
   seqs.push(session.append('compaction/summary', {
     compactionId,
     summary: input.summary,
@@ -396,6 +413,12 @@ export function runCompactionTransaction(
     surfaceOp: { op: 'replace', start: input.start, end: input.end },
     sourceEventSeqs: [...input.shadowedSeqs],
   }).seq)
+  } catch (error) {
+    try {
+      session.append('compaction/end', { compactionId, turn })
+    } catch { /* best effort — the log may itself be unwritable */ }
+    throw error
+  }
 
   seqs.push(session.append('compaction/end', { compactionId, turn }).seq)
   return { compactionId, seqs }

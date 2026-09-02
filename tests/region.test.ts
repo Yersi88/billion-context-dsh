@@ -289,10 +289,43 @@ test('M5: recovery never folds block checkpoint nodes (distillation stays explic
   assert.deepEqual(resolveSurfaceRange(gapped, 3, 9), { start: 6, end: 7, recovered: true })
 })
 
-test('M5: a second active compaction is rejected', () => {
+test('M5: a stale dangling compaction/start self-heals instead of poisoning the session', () => {
   const session = buildTextSession(4)
+  // A crash, SIGKILL, or a throw inside runCompactionTransaction leaves the
+  // compaction/start dangling in the append-only log. The transaction runs
+  // synchronously, so a dangling start observable here is provably stale —
+  // the guard warns and proceeds instead of permanently poisoning every later
+  // compress call (the old behavior threw 'already active' across restarts).
   session.append('compaction/start', { compactionId: 'c1', turn: 1 })
-  assert.throws(() => assertNoActiveCompaction(session.events), /already active/)
+  assert.doesNotThrow(() => assertNoActiveCompaction(session.events))
+  appendUser(session, 'after the crash')
+  assert.doesNotThrow(() => assertNoActiveCompaction(session.events))
+  // A closed pair stays unambiguous.
+  session.append('compaction/end', { compactionId: 'c1', turn: 1 })
+  assert.doesNotThrow(() => assertNoActiveCompaction(session.events))
+})
+
+test('M5: a failed compaction transaction pairs its own compaction/end before rethrowing', () => {
+  const session = buildTextSession(4)
+  // Reproduce the live crash: a replace range naming seqs that are not in the
+  // surface makes the checkpoint-message append throw AFTER compaction/start
+  // was already logged ('surface replace: start seq N not found in surface').
+  assert.throws(
+    () =>
+      runCompactionTransaction(session, {
+        summary: 's',
+        start: 999,
+        end: 1000,
+        shadowedSeqs: [999, 1000],
+        shadowedTokenCount: 10,
+        provider: 'p',
+        model: 'm',
+      }),
+    /surface replace/,
+  )
+  // The compensating compaction/end is in the log: the guard no longer sees a
+  // dangling start, so the session stays usable for later compress calls.
+  assert.doesNotThrow(() => assertNoActiveCompaction(session.events))
 })
 
 test('M5: tool-call ranges are auto-adjusted to balanced edges', () => {
